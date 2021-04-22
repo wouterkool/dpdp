@@ -1,0 +1,39 @@
+{
+  "expt_name": "vrp_uchoa100",
+  
+  "train_filepath": "data/vrp/vrp_uchoa100_train_seed42.pkl",
+  "train_filepath_solution": "results/vrp/vrp_uchoa100_train_seed42/vrp_uchoa100_train_seed42n250000-lkh.pkl",
+
+  "val_filepath": "data/vrp/vrp_uchoa100_validation_seed4321.pkl",
+  "val_filepath_solution": "results/vrp/vrp_uchoa100_validation_seed4321/vrp_uchoa100_validation_seed4321-lkh.pkl",
+  
+  "test_filepath": "data/vrp/vrp_uchoa100_test_seed1234.pkl",
+  "test_filepath_solution": "results/vrp/vrp_uchoa100_test_seed1234/vrp_uchoa100_test_seed1234-lkh.pkl",
+
+  "num_nodes": 100,
+  "num_neighbors": -1,
+    
+  "node_dim": 3,
+  "voc_nodes_in": 2,
+  "voc_nodes_out": 2,
+  "voc_edges_in": 6,
+  "voc_edges_out": 2,
+
+  "beam_size": 1,
+
+  "hidden_dim": 300,
+  "num_layers": 30,
+  "mlp_layers": 3,
+  "aggregation": "mean",
+
+  "max_epochs": 1500,
+  "val_every": 5,
+  "test_every": 100,
+
+  "batch_size": 48,
+  "batches_per_epoch": 500,
+  "accumulation_steps": 1,
+
+  "learning_rate": 0.001,
+  "decay_rate": 1.01
+}
