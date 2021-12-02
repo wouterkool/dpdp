@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn.functional as F
 
+from utils.functions import accurate_cdist
 from utils.mask_utils import packmask
 from utils.scatter_utils import csr_to_counts, counts_to_csr, csr_to_coo, coo_to_csr
 
@@ -101,7 +102,7 @@ class MergedGraph:
 
 class BatchGraph:
 
-    def __init__(self, cost, adj, score=None, quantize_cost=None, quantize_score=None, edge_weight=None):
+    def __init__(self, cost, adj, score=None, quantize_cost=None, quantize_score=None, edge_weight=None, timew=None):
 
         device = cost.device
 
@@ -111,7 +112,10 @@ class BatchGraph:
         self.quantize_cost_ub = None
         if quantize_cost is not None:
             self.quantize_cost_ub, quantize_cost_dtype = quantize_cost
+            assert timew is None or timew.dtype == cost.dtype, "Cost and time windows must have same dtype"
             cost = quantize(cost, self.quantize_cost_ub, dtype=quantize_cost_dtype)
+            if timew is not None:
+                timew = quantize(timew, self.quantize_cost_ub, dtype=quantize_cost_dtype)
 
         self.quantize_score_ub = None
         if score is not None and quantize_score is not None:
@@ -120,6 +124,8 @@ class BatchGraph:
 
         self.cost = cost
         self.score = score
+        self.timew = timew
+        self.has_tw = timew is not None
         self.adj = adj
         # self.adj_in_list = [adj_col.nonzero(as_tuple=False).flatten() for adj_col in adj.t()]
         # self.adj_out_list = [adj_row.nonzero(as_tuple=False).flatten() for adj_row in adj]
@@ -179,8 +185,8 @@ class BatchGraph:
 
     @staticmethod
     def get_graph(
-            coord, score_function='cost', heatmap=None, heatmap_threshold=1e-5, knn=None, quantize_cost_ub=None, quantize_cost_dtype=None,
-            normalize='incoming', demand=None, vehicle_capacity=None, depot_penalty=math.log(0.1),
+            dist, score_function='cost', heatmap=None, heatmap_threshold=1e-5, knn=None, quantize_cost_ub=None, quantize_cost_dtype=None,
+            normalize='incoming', demand=None, vehicle_capacity=None, depot_penalty=math.log(0.1), timew=None,
             start_node=0, node_score_weight=1.0, node_score_dist_to_start_weight=0.1
     ):
         # score_function can be cost, heatmap, heatmap_potential, heatmap_logp
@@ -196,9 +202,14 @@ class BatchGraph:
             score_function_parts = score_function_parts[:-1]
         assert len(score_function_parts) == 1
         score_function = score_function_parts[0]
-        assert score_function in ('cost', 'heatmap')
+        assert score_function in ('cost', 'heatmap', 'costheatmap')
 
-        dist = accurate_cdist(coord, coord)
+        if score_function == 'costheatmap':
+            # Define h_ij = 1 - c_ij / c_max
+            # Smallest normalizer = take max value
+            heatmap = (1 - dist / torch.minimum(dist.max(-1, keepdim=True).values, dist.max(-2, keepdim=True).values)).log()
+            score_function = 'heatmap'  # Treat as if real heatmap
+            assert heatmap_threshold is None, "Not compatible with threshold"
 
         if heatmap_threshold is not None:
             assert heatmap is not None
@@ -218,7 +229,7 @@ class BatchGraph:
                 adj_mask[:, 1:, 0] = True
         else:
             # fully connected
-            adj_mask = torch.eye(coord.size(-2), device=dist.device, dtype=bool).logical_not_()[None].expand_as(dist)
+            adj_mask = torch.eye(dist.size(-2), device=dist.device, dtype=bool).logical_not_()[None].expand_as(dist)
 
         edge_weight = None
         if score_function == "heatmap":
@@ -254,7 +265,8 @@ class BatchGraph:
                 if node_score_dist_to_start_weight != 0:
                     assert demand is None or start_node == 0, "Start node must be 0 (depot) for VRP"
                     # dists_to_start = (coord[start_node, :][None, :] - coord).norm(p=2, dim=-1).unsqueeze(norm_dim)
-                    dists_to_start = (coord[:, start_node, :][:, None, :] - coord).norm(p=2, dim=-1)
+                    # dists_to_start = (coord[:, start_node, :][:, None, :] - coord).norm(p=2, dim=-1)
+                    dists_to_start = dist[:, start_node, :]
                     normalized_dist_to_start = dists_to_start / dists_to_start.max(-1, keepdim=True).values
                     node_score = node_score * (node_score_weight - node_score_dist_to_start_weight * (
                                 normalized_dist_to_start.unsqueeze(norm_dim) - 0.5))
@@ -279,11 +291,11 @@ class BatchGraph:
         # Lower score is better so if we want to maximize log_p we should set negative
         # Note: the edge weight is for later when we want to compute potentials, for now only use log_p
         if demand is None:
-            return BatchGraph(dist, adj_mask, score=score, quantize_cost=quantize_cost, edge_weight=edge_weight)
+            return BatchGraph(dist, adj_mask, score=score, quantize_cost=quantize_cost, edge_weight=edge_weight, timew=timew)
 
         # VRP
         graph = BatchGraph(dist[:, 1:, 1:], adj_mask[:, 1:, 1:], score=score[:, 1:, 1:], quantize_cost=quantize_cost,
-                           edge_weight=edge_weight[:, 1:, 1:] if edge_weight is not None else None)
+                           edge_weight=edge_weight[:, 1:, 1:] if edge_weight is not None else None, timew=timew)
         assert demand.numel() == len(graph.nodes)
         assert (demand > 0).all()
         assert (demand <= vehicle_capacity[:, None]).all()
@@ -421,9 +433,16 @@ class Graph:
             score_function_parts = score_function_parts[:-1]
         assert len(score_function_parts) == 1
         score_function = score_function_parts[0]
-        assert score_function in ('cost', 'heatmap')
+        assert score_function in ('cost', 'heatmap', 'costheatmap')
 
         dist = accurate_cdist(coord, coord)
+
+        if score_function == 'costheatmap':
+            # Define h_ij = 1 - c_ij / c_max
+            # Smallest normalizer = take max value
+            heatmap = (1 - dist / torch.minimum(dist.max(0, keepdim=True).values, dist.max(1, keepdim=True).values)).log()
+            score_function = 'heatmap'  # Treat as if real heatmap
+            assert heatmap_threshold is None, "Not compatible with threshold"
 
         if heatmap_threshold is not None:
             assert heatmap is not None
@@ -575,6 +594,3 @@ def dequantize(val, ub):
     return (val / torch.iinfo(val.dtype).max) * ub
 
 
-def accurate_cdist(x1, x2):
-    # Do not use matrix multiplication since this is inaccurate
-    return torch.cdist(x1, x2, compute_mode='donot_use_mm_for_euclid_dist')

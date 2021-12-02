@@ -38,7 +38,7 @@ pip install tensorboardx==1.5 fastprogress==0.1.18
 # conda install -c conda-forge cupy cudatoolkit=10.2 -y
 pip install cupy-cuda102
 # Also some efficient sparse operations using https://github.com/rusty1s/pytorch_scatter
-pip install torch-scatter -f https://pytorch-geometric.com/whl/torch-1.7.0+cu102.html
+pip install torch-scatter -f https://pytorch-geometric.com/whl/torch-1.8.0+cu102.html
 ```
 
 ## Generate instances (or download)
@@ -47,7 +47,8 @@ For TSP, we don't generate training instances as we used the pre-trained model f
 ```bash
 # Generate validation and test data for tsp and vrp
 python generate_data.py --problem all --name validation --seed 4321
-python generate_data.py --problem all --name test --seed 1234
+# Note, due to some subtle differences it is recommended to download the test data rather than generate (see below)
+# python generate_data.py --problem all --name test --seed 1234
 # Note: training data only needed if you want to train a model yourself (here only vrp)
 python generate_data.py --problem vrp --name train --seed 42 --dataset_size 1000000 # May take some minutes, feel free to optimize!
 ```
@@ -185,6 +186,12 @@ cd ..
 ## Generate heatmaps
 To generate heatmaps, use the following commands:
 ```bash
+# Validation set
+python export_heatmap.py --problem tsp --checkpoint logs/tsp100/best_val_checkpoint.tar --instances data/tsp/tsp100_validation_seed4321.pkl -f --batch_size 50 --no_prepwrap
+python export_heatmap.py --problem vrp --checkpoint logs/vrp_nazari100/best_val_loss_checkpoint.tar --instances data/vrp/vrp_nazari100_validation_seed4321.pkl -f --batch_size 50
+python export_heatmap.py --problem vrp --checkpoint logs/vrp_uchoa100/best_val_loss_checkpoint.tar --instances data/vrp/vrp_uchoa100_validation_seed4321.pkl -f --batch_size 50
+
+# Test set
 python export_heatmap.py --problem tsp --checkpoint logs/tsp100/best_val_checkpoint.tar --instances data/tsp/tsp100_test_seed1234.pkl -f --batch_size 50 --no_prepwrap
 python export_heatmap.py --problem vrp --checkpoint logs/vrp_nazari100/best_val_loss_checkpoint.tar --instances data/vrp/vrp_nazari100_test_seed1234.pkl -f --batch_size 50
 python export_heatmap.py --problem vrp --checkpoint logs/vrp_uchoa100/best_val_loss_checkpoint.tar --instances data/vrp/vrp_uchoa100_test_seed1234.pkl -f --batch_size 50
@@ -278,6 +285,16 @@ experiments/main_results.sh cvrp vrp/vrp_nazari100_test_seed1234 heatmaps_vrp_na
 experiments/main_results.sh cvrp vrp/vrp_uchoa100_test_seed1234 heatmaps_vrp_uchoa100
 ```
 
+#### TSP with Time Windows (TSPTW)
+The datasets, heatmaps and pretrained models for TSPTW can all be found [here](https://drive.google.com/drive/folders/18Z-FLvLVZmot19nXHViLeZiCZm1Qu27v?usp=sharing). After downloading the training data, you can use the following commands for the da Silva et al. dataset:
+
+```bash
+python main_tsp.py --config configs/tsptwds100_dir.json
+python export_heatmap.py --problem tsptw --checkpoint logs/tsptwds100_dir/best_val_loss_checkpoint.tar --instances data/tsptw/tsptw_da_silva100_test_seed1234.pkl -f --batch_size 50
+python eval.py data/tsptw/tsptw_da_silva100_test_seed1234.pkl --problem tsptw --decode_strategy dpdp --score_function heatmap_potential --beam_size 100000 --heatmap_threshold 1e-5 --heatmap results/tsptw/tsptw_da_silva100_test_seed1234/heatmaps/heatmaps_tsptwds100_dir.pkl
+```
+
+
 ### Ablations ([download](https://drive.google.com/drive/folders/1N_MMmHnUF4AXFYN1hpj8K9HV1IHot6ey?usp=sharing))
 
 #### Scoring policy
@@ -306,4 +323,4 @@ python visualize.py --problem vrp --instances data/vrp/vrp_nazari100_validation_
 ![pipeline](res/vrp.png)
 
 ## Acknowledgements
-This repository was built upon the excellent repository [graph-convnet-tsp](https://github.com/chaitjo/graph-convnet-tsp) by Chaitanya K. Joshi and my own repository [attention-learn-to-route](https://github.com/wouterkool/attention-learn-to-route).
+This repository was built upon the excellent repository [graph-convnet-tsp](https://github.com/chaitjo/graph-convnet-tsp) by Chaitanya K. Joshi and my own repository [attention-learn-to-route](https://github.com/wouterkool/attention-learn-to-route). The TSPTW GVNS code is from the repository [TSPTW](https://github.com/sashakh/TSPTW), adapted from [the original code](http://homepages.dcc.ufmg.br/~rfsilva/tsptw/) of da Silva et al. We thank Quentin Cappart for kindly providing TSPTW instances and results.

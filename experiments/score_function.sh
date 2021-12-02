@@ -35,7 +35,7 @@ do
   fi
 
   echo "Running beam_size ${beam_size}"
-  for score_function in "heatmap_potential" "heatmap" "cost"
+  for score_function in "heatmap_potential" "heatmap" "cost" "costheatmap" "costheatmap_potential"
   do
     echo "Running beam_size ${beam_size} ${score_function}"
     python eval.py data/${dataset}.pkl \

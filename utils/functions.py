@@ -87,7 +87,7 @@ def chunks(lst, n):
         yield lst[i:i + n]
 
 
-def compute_dataset_costs(problem, dataset, sequences, device=None, check_costs=None, batch_size=1000):
+def compute_dataset_costs(problem, dataset, sequences, device=None, check_costs=None, batch_size=1000, warn_only=False):
     dataloader = DataLoader(dataset, batch_size=batch_size)
 
     if check_costs is not None:
@@ -95,13 +95,13 @@ def compute_dataset_costs(problem, dataset, sequences, device=None, check_costs=
 
     costs_of_batches = (
         compute_batch_costs(problem, batch, seq, device=device,
-                            check_costs=next(check_costs) if check_costs is not None else None)
+                            check_costs=next(check_costs) if check_costs is not None else None, warn_only=warn_only)
         for batch, seq in zip(dataloader, chunks(sequences, batch_size))
     )
     return [c for costs_of_batch in costs_of_batches for c in costs_of_batch]
 
 
-def compute_batch_costs(problem, batch, sequences, device=None, check_costs=None):
+def compute_batch_costs(problem, batch, sequences, device=None, check_costs=None, warn_only=False):
     idx_success = torch.tensor([i for i, seq in enumerate(sequences) if seq is not None], device=device)
     if len(idx_success) == 0:
         return [None] * len(sequences)
@@ -116,10 +116,17 @@ def compute_batch_costs(problem, batch, sequences, device=None, check_costs=None
         check_costs_success = [check_costs[i] for i in idx_success]
         isclose = torch.isclose(costs_success, costs_success.new_tensor(check_costs_success), atol=1e-10)
         if not isclose.all():
-            print("Warning check cost {} not exactly equal to {}".format(costs_success, check_costs_success))
-        assert torch.allclose(costs_success, costs_success.new_tensor(check_costs_success),
+            idx_notclose = (~isclose).nonzero().flatten()
+            print("Warning check cost {} not exactly equal to {} for idx {}".format(
+                costs_success[idx_notclose], check_costs_success[idx_notclose], idx_notclose))
+        assert warn_only or torch.allclose(costs_success, costs_success.new_tensor(check_costs_success),
                               atol=1e-4), "Check cost {} not equal to {}".format(costs_success, check_costs_success)
     costs = [None] * len(sequences)
     for i, cost in zip(idx_success, costs_success):
         costs[i] = cost.item()
     return costs
+
+
+def accurate_cdist(x1, x2):
+    # Do not use matrix multiplication since this is inaccurate
+    return torch.cdist(x1, x2, compute_mode='donot_use_mm_for_euclid_dist')

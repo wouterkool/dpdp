@@ -7,7 +7,7 @@ import itertools
 from tqdm import tqdm
 from problems import load_problem
 from utils.data_utils import save_dataset, load_heatmaps
-from utils.functions import move_to, get_durations, compute_batch_costs
+from utils.functions import move_to, get_durations, compute_batch_costs, accurate_cdist
 from torch.utils.data import DataLoader
 import time
 from dp import BatchGraph, StreamingTopK, SimpleBatchTopK, run_dp
@@ -18,14 +18,27 @@ from torch.utils.data import Dataset
 mp = torch.multiprocessing.get_context('spawn')
 
 
-def evaluate_dp(is_vrp, batch, heatmaps, beam_size, collapse, score_function, heatmap_threshold, knn, verbose):
+def evaluate_dp(is_vrp, has_tw, batch, heatmaps, beam_size, collapse, score_function,
+                heatmap_threshold, knn, use_weak_version, verbose):
 
-    coords = torch.cat((batch['depot'][:, None], batch['loc']), 1) if is_vrp else batch
+    coords = torch.cat((batch['depot'][:, None], batch['loc']), 1).float() if is_vrp or has_tw else batch
     demands = batch['demand'] if is_vrp else None
     vehicle_capacities = batch['capacity'] if is_vrp else None
+    timew = batch['timew'] if has_tw else None
+    dist = accurate_cdist(coords, coords)
+    quant_c_dt = torch.int32
+    if has_tw:
+        dist = dist.round()
+        assert (dist.max(-1).values.sum(-1) < torch.iinfo(torch.int).max).all()
+        assert (timew < torch.iinfo(torch.int).max).all()
+        dist = dist.int()
+        timew = timew.int()
+        quant_c_dt = None  # Don't use quantization since we're using ints already
+        batch['dist'] = dist  # For final distance computation
+
     graph = BatchGraph.get_graph(
-        coords, score_function=score_function, heatmap=heatmaps, heatmap_threshold=heatmap_threshold, knn=knn, quantize_cost_dtype=torch.int32,
-        demand=demands, vehicle_capacity=vehicle_capacities,
+        dist, score_function=score_function, heatmap=heatmaps, heatmap_threshold=heatmap_threshold, knn=knn,
+        quantize_cost_dtype=quant_c_dt, demand=demands, vehicle_capacity=vehicle_capacities, timew=timew,
         start_node=0, node_score_weight=1.0, node_score_dist_to_start_weight=0.1
     )
     assert graph.batch_size == len(coords)
@@ -46,9 +59,8 @@ def evaluate_dp(is_vrp, batch, heatmaps, beam_size, collapse, score_function, he
             kthvalue_method='sort',  # Other methods may increase performance but are experimental / buggy
             batch_size=graph.batch_size
         )
-
     mincost_dp_qt, solution = run_dp(
-        graph, candidate_queue, return_solution=True, collapse=collapse,
+        graph, candidate_queue, return_solution=True, collapse=collapse, use_weak_version=use_weak_version,
         beam_device=coords.device, bound_first=True, # Always bound first #is_vrp or beam_size >= int(1e7),
         sort_beam_by='group_idx', trace_device='cpu',
         verbose=verbose, add_potentials=add_potentials
@@ -89,7 +101,8 @@ def pack_heatmaps(dataset, opts, offset=None):
     if opts.heatmap is None:
         return dataset
     offset = offset or opts.offset
-    return HeatmapDataset(dataset, load_heatmaps(opts.heatmap, symmetric=True)[offset:offset+len(dataset)])
+    # For TSPTW, use undirected heatmap since problem is undirected because of time windows
+    return HeatmapDataset(dataset, load_heatmaps(opts.heatmap, symmetric=opts.problem != 'tsptw')[offset:offset+len(dataset)])
 
 
 def eval_dataset_mp(args):
@@ -97,7 +110,7 @@ def eval_dataset_mp(args):
 
     problem = load_problem(opts.problem)
     val_size = opts.val_size // num_processes
-    make_dataset_kwargs = {'normalize': False} if opts.decode_strategy in ('dpbs', 'dpdp') and problem.NAME == 'cvrp' else {}
+    make_dataset_kwargs = {'normalize': False} if opts.decode_strategy[:4] in ('dpbs', 'dpdp') and problem.NAME == 'cvrp' else {}
     dataset = problem.make_dataset(filename=dataset_path, num_samples=val_size, offset=opts.offset + val_size * i, **make_dataset_kwargs)
     dataset = pack_heatmaps(dataset, opts, offset=opts.offset + val_size * i)
     device = torch.device("cuda:{}".format(device_num) if device_num is not None else 'cpu')
@@ -134,7 +147,7 @@ def eval_dataset(dataset_path, beam_size, opts):
 
     else:
         device = torch.device("cuda:0" if use_cuda else "cpu")
-        make_dataset_kwargs = {'normalize': False} if opts.decode_strategy in ('dpbs', 'dpdp') and problem.NAME == 'cvrp' else {}
+        make_dataset_kwargs = {'normalize': False} if opts.decode_strategy[:4] in ('dpbs', 'dpdp') and problem.NAME == 'cvrp' else {}
         dataset = problem.make_dataset(filename=dataset_path, num_samples=opts.val_size, offset=opts.offset, **make_dataset_kwargs)
         dataset = pack_heatmaps(dataset, opts)
         results = _eval_dataset(problem, dataset, beam_size, opts, device, no_progress_bar=opts.no_progress_bar)
@@ -142,10 +155,10 @@ def eval_dataset(dataset_path, beam_size, opts):
     costs, durations, tours = print_statistics(results, opts)
 
     dataset_basename, ext = os.path.splitext(os.path.split(dataset_path)[-1])
-    heatmap_basename, _ = os.path.splitext(os.path.split(opts.heatmap)[-1]) if opts.heatmap is not None else ""
+    heatmap_basename = os.path.splitext(os.path.split(opts.heatmap)[-1])[0] if opts.heatmap is not None else ""
     if opts.o is None:
         
-        results_dir = os.path.join(opts.results_dir, 'vrp' if problem.NAME == 'cvrp' else 'tsp', dataset_basename)
+        results_dir = os.path.join(opts.results_dir, 'vrp' if problem.NAME == 'cvrp' else problem.NAME, dataset_basename)
         os.makedirs(results_dir, exist_ok=True)
 
         out_file = os.path.join(results_dir, "{}{}{}-{}-{}{}{}-{}{}{}".format(
@@ -224,23 +237,35 @@ def _eval_dataset(problem, dataset, beam_size, opts, device, no_progress_bar=Fal
         start = time.time()
         with torch.no_grad():
 
-            if opts.decode_strategy in ('dpbs', 'dpdp'):
+            if opts.decode_strategy[:4] in ('dpbs', 'dpdp'):
 
                 assert opts.heatmap_threshold is None or opts.knn is None, "Cannot have both"
-                assert problem.NAME in ('cvrp', 'tsp')
+                assert problem.NAME in ('cvrp', 'tsp', 'tsptw')
                 # Deep policy beam search or deep policy dynamic programming = new style implementation
-                sequences, costs, batch_size = evaluate_dp(
-                    problem.NAME == 'cvrp', batch, heatmaps=heatmaps,
-                    beam_size=beam_size, collapse=opts.decode_strategy == 'dpdp', score_function=opts.score_function,
-                    heatmap_threshold=opts.heatmap_threshold, knn=opts.knn, verbose=opts.verbose
-                )
+
+                batch_size = len(batch) if problem.NAME == 'tsp' else len(batch['loc'])
+                try:
+                    sequences, costs, batch_size = evaluate_dp(
+                        problem.NAME == 'cvrp', problem.NAME == 'tsptw', batch, heatmaps=heatmaps,
+                        beam_size=beam_size, collapse=opts.decode_strategy[:4] == 'dpdp', score_function=opts.score_function,
+                        heatmap_threshold=opts.heatmap_threshold, knn=opts.knn, use_weak_version=opts.decode_strategy[-1] == '-',
+                        verbose=opts.verbose
+                    )
+                except RuntimeError as e:
+                    if 'out of memory' in str(e) and opts.skip_oom:
+                        print('| WARNING: ran out of memory, skipping batch')
+                        sequences = [None] * batch_size
+                        costs = [None] * batch_size
+                    else:
+                        raise e
+
                 costs = compute_batch_costs(problem, batch, sequences, device=device, check_costs=costs)
 
         assert len(sequences) == batch_size
         duration = time.time() - start
         # print(sequences, costs)
         for seq, cost in zip(sequences, costs):
-            if problem.NAME == "tsp":
+            if problem.NAME in ("tsp", "tsptw"):
                 if seq is not None:  # tsptw can be infeasible or TSP failed with sparse graph
                     seq = seq.tolist()  # No need to trim as all are same length
             elif problem.NAME == "cvrp":
@@ -264,7 +289,7 @@ if __name__ == "__main__":
                         help='Number of instances used for reporting validation performance')
     parser.add_argument('--offset', type=int, default=0,
                         help='Offset where to start in dataset (default 0)')
-    parser.add_argument('--batch_size', type=int, default=1024,
+    parser.add_argument('--batch_size', type=int, default=1,
                         help="Batch size to use during evaluation (per GPU)")
     parser.add_argument('--beam_size', type=int, nargs='+',
                         help='Sizes of beam to use for beam search/DP')
@@ -283,6 +308,7 @@ if __name__ == "__main__":
     parser.add_argument('--heatmap_threshold', type=float, default=None, help="Use sparse graph based on heatmap treshold")
     parser.add_argument('--knn', type=int, default=None, help="Use sparse knn graph")
     parser.add_argument('--kthvalue_method', type=str, default='sort', help="Which kthvalue method to use for dpdp ('auto' = auto determine)")
+    parser.add_argument('--skip_oom', action='store_true', help='Skip batch when out of memory')
 
     opts = parser.parse_args()
     assert opts.o is None or (len(opts.datasets) == 1 and len(opts.beam_size) <= 1), \

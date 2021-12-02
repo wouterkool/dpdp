@@ -148,10 +148,11 @@ class EdgeFeatures(nn.Module):
     e_ij = U*e_ij + V*(x_i + x_j)
     """
 
-    def __init__(self, hidden_dim):
+    def __init__(self, hidden_dim, directed=False):
         super(EdgeFeatures, self).__init__()
         self.U = nn.Linear(hidden_dim, hidden_dim, True)
         self.V = nn.Linear(hidden_dim, hidden_dim, True)
+        self.W = nn.Linear(hidden_dim, hidden_dim, True) if directed else None
         
     def forward(self, x, e, edge_index=None):
         """
@@ -164,15 +165,15 @@ class EdgeFeatures(nn.Module):
         """
         Ue = self.U(e)
         Vx = self.V(x)
-
+        Wx = Vx if self.W is None else self.W(x)  # If self.W is none, graph is undirected
         if edge_index is not None:
             # Sparse version
             src, dst = edge_index
-            Wx = Vx[src]
-            Vx = Vx[dst]
+            Wx = Wx[dst]  # = to
+            Vx = Vx[src]  # = from
         else:
-            Wx = Vx.unsqueeze(1)  # Extend Vx from "B x V x H" to "B x V x 1 x H"
-            Vx = Vx.unsqueeze(2)  # extend Vx from "B x V x H" to "B x 1 x V x H"
+            Wx = Wx.unsqueeze(1)  # Extend Wx from "B x V x H" to "B x 1 x V x H" = to
+            Vx = Vx.unsqueeze(2)  # extend Vx from "B x V x H" to "B x V x 1 x H" = from
 
         e_new = Ue + Vx + Wx
         return e_new
@@ -182,10 +183,10 @@ class ResidualGatedGCNLayer(nn.Module):
     """Convnet layer with gating and residual connection.
     """
 
-    def __init__(self, hidden_dim, aggregation="sum"):
+    def __init__(self, hidden_dim, aggregation="sum", directed=True):
         super(ResidualGatedGCNLayer, self).__init__()
         self.node_feat = NodeFeatures(hidden_dim, aggregation)
-        self.edge_feat = EdgeFeatures(hidden_dim)
+        self.edge_feat = EdgeFeatures(hidden_dim, directed)
         self.bn_node = BatchNormNode(hidden_dim)
         self.bn_edge = BatchNormEdge(hidden_dim)
 

@@ -11,7 +11,11 @@ def get_max_group_size(coo, max_group_size=None):
     return counts.max()
 
 
-def segment_cummax_coo(vals, coo, max_group_size=None):
+def segment_cummin_coo(vals, coo, max_group_size=None):
+    return segment_cummax_coo(vals, coo, max_group_size, max_func=torch.minimum)
+
+
+def segment_cummax_coo(vals, coo, max_group_size=None, max_func=torch.maximum):
     max_group_size = get_max_group_size(coo, max_group_size)
 
     step = 1
@@ -21,7 +25,7 @@ def segment_cummax_coo(vals, coo, max_group_size=None):
     # max_vals[0] = vals[0]
     while (step < max_group_size):
         # For some stupid reason torch.where has no out parameter
-        max_vals[step:] = torch.where(coo[step:] == coo[:-step], torch.maximum(max_vals[step:], max_vals[:-step]),
+        max_vals[step:] = torch.where(coo[step:] == coo[:-step], max_func(max_vals[step:], max_vals[:-step]),
                                       max_vals[step:])
 
         #         torch.maximum(max_vals[step:], max_vals[:-step].masked_fill(coo[step:] != coo[:-step], minval), out=max_vals[step:])

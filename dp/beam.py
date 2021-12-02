@@ -46,6 +46,7 @@ class Beam:
             self.current_csr = None
             self.current_counts = None
         self.cost = torch.zeros(batch_size, dtype=cost_dtype, device=device)
+        self.time = torch.zeros(batch_size, dtype=cost_dtype, device=device)
         self.score = torch.zeros(batch_size, dtype=score_dtype, device=device) if score_dtype is not None else None
         self.vehicle_capacity = vehicle_capacity
         self.remaining_capacity = torch.as_tensor(vehicle_capacity, device=device).flatten() if vehicle_capacity is not None else None  # Dtype inferred from capacity
@@ -67,7 +68,7 @@ class Beam:
             return torch.empty_like(mask).copy_(mask) if copy else mask.to(device)
         return mask.to(device).index_select(-1, self.mask_idx)
 
-    def update(self, mask, current, cost, parent=None, score=None, compute_unique_device=None, remaining_capacity=None, last_action=None, potential_info=None, batch_ids=0):
+    def update(self, mask, current, cost, parent=None, score=None, time=None, compute_unique_device=None, remaining_capacity=None, last_action=None, potential_info=None, batch_ids=0):
         # We will group all the entries in the beam by the mask (for each batch_id)
 
         device = mask[0].device
@@ -101,6 +102,8 @@ class Beam:
             cost = torch.gather(cost, 0, argsort)
             if score is not None:
                 score = torch.gather(score, 0, argsort)
+            if time is not None:
+                time = torch.gather(time, 0, argsort)
             if remaining_capacity is not None:
                 remaining_capacity = torch.gather(remaining_capacity, 0, argsort)
             if last_action is not None:
@@ -129,6 +132,7 @@ class Beam:
         self.current_csr = current_csr
         self.current_counts = current_counts
         self.cost = cost
+        self.time = time
         self.score = score
         self.remaining_capacity = remaining_capacity
         self.last_action = last_action if last_action is not None else current  # For TSP, last action is current
@@ -199,6 +203,7 @@ def update_beam(actions, beam, compute_unique_device, graph, parents, profiler, 
     else:
         all_current_node = actions
     all_remaining_capacity = None
+    all_time = None
     new_potential_info = None
     all_parent_beamrows_l = parents.long()
     all_parent_batch_id = beam.batch_ids.gather(0, all_parent_beamrows_l) if graph.is_batch else 0
@@ -213,10 +218,11 @@ def update_beam(actions, beam, compute_unique_device, graph, parents, profiler, 
                 graph.vehicle_capacity.gather(0, all_parent_batch_id),
                 beam.remaining_capacity.gather(0, all_parent_beamrows_l)
             ) - graph.demand[all_parent_batch_id, all_current_l]
-        if beam.score is not None:
+        if beam.score is not None or graph.has_tw:
             # Since we have a score, the cost is not equal to the score so we need to compute it
             # If we have potentials, we also need to recompute the score, since we want the score without potentials
             if graph.is_vrp:
+                assert not graph.has_tw
                 if beam.current is None:
                     # First step for vrp we don't have a current since we come from depot
                     all_cost = graph.cost_from_depot[all_parent_batch_id, all_current_l]
@@ -238,8 +244,14 @@ def update_beam(actions, beam, compute_unique_device, graph, parents, profiler, 
                         ))
             else:
                 prev = beam.current.gather(0, all_parent_beamrows_l).long()
-                all_cost = beam.cost.gather(0, all_parent_beamrows_l) + graph.cost[
-                    all_parent_batch_id, prev, all_current_l]
+                dcost = graph.cost[all_parent_batch_id, prev, all_current_l]
+                all_cost = beam.cost.gather(0, all_parent_beamrows_l) + dcost
+                if graph.has_tw:
+                    all_time = torch.maximum(  # Ensure arrival is not before time window start
+                        beam.time.gather(0, all_parent_beamrows_l) + dcost,
+                        graph.timew[all_parent_batch_id, all_current_l, 0]
+                    )
+                    assert (all_time <= graph.timew[all_parent_batch_id, all_current_l, 1]).all()
                 if beam.potential_info is not None:
                     scores = beam.score.gather(0, all_parent_beamrows_l) + graph.score[
                         all_parent_batch_id, prev, all_current_l]
@@ -264,7 +276,7 @@ def update_beam(actions, beam, compute_unique_device, graph, parents, profiler, 
     del mask
     del mask_idx
     profiler.log('update_mask')
-    beam.update(new_mask, all_current_node, all_cost, parents, score=scores,
+    beam.update(new_mask, all_current_node, all_cost, parents, score=scores, time=all_time,
                 compute_unique_device=compute_unique_device, remaining_capacity=all_remaining_capacity,
                 last_action=actions if graph.is_vrp else None, potential_info=new_potential_info,
                 batch_ids=all_parent_batch_id)

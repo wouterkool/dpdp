@@ -12,52 +12,92 @@ from datetime import timedelta
 from utils.functions import run_all_in_pool
 
 
-def evaluate_dp(depot, loc, demand, vehicle_capacity, heatmap, beam_size, collapse, score_function, heatmap_threshold, knn, verbose, device=None):
-    import torch
-    from dp import Graph, StreamingTopK, run_dp
+def get_hgs_executable(url="https://github.com/vidalt/HGS-CVRP/archive/refs/heads/main.zip"):
+# def get_hgs_exectuable(url="https://github.com/wouterkool/HGS-CVRP/archive/refs/heads/main.zip"):
 
-    # coord = torch.from_numpy(np.concatenate((depot[None], loc), 0)).to(device)
-    coord = torch.cat((torch.tensor(depot)[None], torch.tensor(loc)), 0).to(device)
-    demand = torch.tensor(demand).to(device)
+    cwd = os.path.abspath(os.path.join("problems", "vrp", "hgs"))
+    os.makedirs(cwd, exist_ok=True)
 
-    graph = Graph.get_graph(
-        coord, score_function=score_function, heatmap=heatmap, heatmap_threshold=heatmap_threshold, knn=knn, quantize_cost_dtype=torch.int32,
-        demand=demand, vehicle_capacity=vehicle_capacity,
-        start_node=0, node_score_weight=1.0, node_score_dist_to_start_weight=0.1
-    )
+    file = os.path.join(cwd, os.path.split(urlparse(url).path)[-1])
+    filedir = os.path.join(cwd, "HGS-CVRP-main")
 
-    add_potentials = graph.edge_weight is not None
-    assert add_potentials == ("potential" in score_function.split("_"))
+    if not os.path.isdir(filedir):
+        print("{} not found, downloading and compiling".format(filedir))
 
-    candidate_queue = StreamingTopK(
-        beam_size,
-        dtype=graph.score.dtype if graph.score is not None else graph.cost.dtype,
-        verbose=verbose,
-        payload_dtypes=(torch.int32, torch.int16),  # parent = max 1e9, action = max 2e3 (for VRP with 1000 nodes)
-        device=coord.device,
-        alloc_size_factor=10. if beam_size <= int(1e6) else 2.,  # up to 1M we can easily allocate 10x so 10MB
-        kthvalue_method='sort'  # Other methods may increase performance but are experimental / buggy
-    )
+        check_call(["wget", url], cwd=cwd)
+        assert os.path.isfile(file), "Download failed, {} does not exist".format(file)
+        check_call(["unzip", file], cwd=cwd)
 
-    start = time.time()
-    mincost_dp_qt, solution = run_dp(graph, candidate_queue, return_solution=True, collapse=collapse,
-           beam_device=coord.device, bound_first=True,  # Always bound first #is_vrp or beam_size >= int(1e7),
-           sort_beam_by='group_idx', trace_device='cpu',
-           verbose=verbose, add_potentials=add_potentials
-    )
+        # See README, we set isRoundingInteger = False since we don't want to round distances
+        check_call(["sed", "-i", "s/isRoundingInteger = true;/isRoundingInteger = false;/g", "Program/Params.cpp"], cwd=filedir)
 
-    duration = time.time() - start
-    if solution is None:
-        print("Unable to find solution!")
-        cost = None
-    else:
-        # TODO check
-        tour = solution.cpu().numpy()
-        mincost_dp = graph.dequantize_cost(mincost_dp_qt).item()
+        assert os.path.isdir(filedir), "Extracting failed, dir {} does not exist".format(filedir)
+        check_call("make", cwd=os.path.join(filedir, "Program"))
+        os.remove(file)
+
+    executable = os.path.join(filedir, "Program", "genvrp")
+    assert os.path.isfile(executable)
+    return os.path.abspath(executable)
+
+
+def solve_hgs_log(executable, directory, name, depot, loc, demand, capacity,
+                  grid_size=1, runs=1, disable_cache=False, only_cache=False):
+
+    # lkhu = LKH with unlimited routes/salesmen
+    # alg_name = 'lkhu' if unlimited_routes else 'lkh'
+    # basename = "{}.{}{}".format(name, alg_name, runs)
+    basename = "{}.{}".format(name, 'hgs')
+    problem_filename = os.path.join(directory, "{}.vrp".format(basename))
+    tour_filename = os.path.join(directory, "{}.tour".format(basename))
+    output_filename = os.path.join(directory, "{}.pkl".format(basename))
+    param_filename = os.path.join(directory, "{}.par".format(basename))
+    log_filename = os.path.join(directory, "{}.log".format(basename))
+
+    try:
+        # May have already been run
+        if os.path.isfile(output_filename) and not disable_cache:
+            tour, duration = load_dataset(output_filename)
+            hgs_cost = None
+        elif not only_cache:
+            write_vrplib(problem_filename, depot, loc, demand, capacity, grid_size, name=name, integer_scale=None)
+
+            with open(log_filename, 'w') as f:
+                start = time.time()
+                check_call([executable, problem_filename, tour_filename, '-seed', '1234'], stdout=f, stderr=f)
+                duration = time.time() - start
+
+            tour, hgs_cost, _ = read_hgstour(tour_filename, n=len(demand))
+
+            save_dataset((tour, duration), output_filename)
+        else:
+            raise Exception("No cached solution found")
+
+        # Calculate cost using own metric
         cost = calc_vrp_cost(depot, loc, tour)
-        assert np.allclose(cost, mincost_dp)
+        assert hgs_cost is None or np.allclose(cost, hgs_cost, rtol=1e-4)
+        return cost, tour, duration
 
-    return cost, tour, duration
+    except Exception as e:
+        print("Exception occured")
+        print(e)
+        return None
+
+
+def read_hgstour(filename, n):
+    with open(filename, 'r') as f:
+        tour = []
+        cost = None
+        time = None
+        for line in f:
+            if line.startswith("Route"):
+                if len(tour) > 0:
+                    tour.append(0)  # Depot
+                tour.extend(int(node) for node in line.split(": ")[-1].split(" "))
+            elif line.startswith("Cost"):
+                cost = float(line.split(" ")[-1])
+            elif line.startswith("Time"):
+                time = float(line.split(" ")[-1])
+    return tour, cost, time
 
 
 def get_lkh_executable(url="http://www.akira.ruc.dk/~keld/research/LKH-3/LKH-3.0.4.tgz"):
@@ -215,13 +255,16 @@ def read_vrplib(filename, n):
     return tour[1:].tolist()
 
 
-def write_vrplib(filename, depot, loc, demand, capacity, grid_size, name="problem"):
+def write_vrplib(filename, depot, loc, demand, capacity, grid_size, name="problem", integer_scale=100000):
+    # LKH/VRP does not take floats (HGS seems to do)
+    map_coord = (lambda x: x) if integer_scale is None else (lambda x: int(x/grid_size * integer_scale + 0.5))
 
     with open(filename, 'w') as f:
         f.write("\n".join([
             "{} : {}".format(k, v)
             for k, v in (
                 ("NAME", name),
+                ("COMMENT", "comment"),  # For HGS we need an extra row...
                 ("TYPE", "CVRP"),
                 ("DIMENSION", len(loc) + 1),
                 ("EDGE_WEIGHT_TYPE", "EUC_2D"),
@@ -231,8 +274,7 @@ def write_vrplib(filename, depot, loc, demand, capacity, grid_size, name="proble
         f.write("\n")
         f.write("NODE_COORD_SECTION\n")
         f.write("\n".join([
-            "{}\t{}\t{}".format(i + 1, int(x / grid_size * 100000 + 0.5), int(y / grid_size * 100000 + 0.5))  # VRPlib does not take floats
-            #"{}\t{}\t{}".format(i + 1, x, y)
+            "{}\t{}\t{}".format(i + 1, map_coord(x), map_coord(y))
             for i, (x, y) in enumerate([depot] + loc)
         ]))
         f.write("\n")
@@ -289,12 +331,11 @@ def write_vrp_edges(filename, mask, num_depots=None):
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("method", help="Name of the method to evaluate, 'lkh', 'dpdp' or 'dpbs'")
+    parser.add_argument("method", help="Name of the method to evaluate, 'lkh' or 'hgs'")
     parser.add_argument("datasets", nargs='+', help="Filename of the dataset(s) to evaluate")
     parser.add_argument("-f", action='store_true', help="Set true to overwrite")
     parser.add_argument("-o", default=None, help="Name of the results file to write")
     parser.add_argument("--cpus", type=int, help="Number of CPUs to use, defaults to all cores")
-    parser.add_argument('--no_cuda', action='store_true', help='Disable CUDA')
     parser.add_argument('--disable_cache', action='store_true', help='Disable caching')
     parser.add_argument('--only_cache', action='store_true',
                         help='Only get results from cache, fail instance if no cached solution available')
@@ -307,11 +348,6 @@ if __name__ == "__main__":
     parser.add_argument('--heatmap', default=None, help="Heatmaps to use")
     parser.add_argument('--heatmap_threshold', type=float, default=1e-5, help="Min threshold for heatmaps")
     parser.add_argument('--heatmap_max_edges', type=int, default=None, help="Max number of edges for heatmaps")
-    parser.add_argument('--score_function', type=str, default='heatmap_potential',
-                        help="Policy/score function to use to select beam: 'cost', 'heatmap' or 'heatmap_potential'")
-    parser.add_argument('--beam_size', type=int, default=None, help="Beam size with DPDP")
-    parser.add_argument('--knn', type=int, default=-1, help="Use K-nearest neighbor graph with DPDP")
-    parser.add_argument('--verbose', action='store_true', help='Set to show verbose output')
 
     opts = parser.parse_args()
 
@@ -376,8 +412,8 @@ if __name__ == "__main__":
         else:
             dataset = [(instance, None) for instance in raw_dataset]
 
-        if method == "lkh" or method == "lkhu":
-            executable = get_lkh_executable()
+        if method in ("lkh", "lkhu", "hgs"):
+            executable = get_hgs_executable() if method == "hgs" else get_lkh_executable()
 
             use_multiprocessing = False
             unlimited_routes = method == "lkhu"
@@ -390,6 +426,14 @@ if __name__ == "__main__":
                 if len(args) > 0:
                     depot_types, customer_types, grid_size = args
 
+                if method == "hgs":
+                    return solve_hgs_log(
+                        executable,
+                        directory, name,
+                        depot, loc, demand, capacity, grid_size,
+                        disable_cache=opts.disable_cache,
+                        only_cache=opts.only_cache
+                    )
                 return solve_lkh_log(
                     executable,
                     directory, name,
@@ -404,38 +448,6 @@ if __name__ == "__main__":
             results, parallelism = run_all_in_pool(
                 run_func,
                 target_dir, dataset, opts, use_multiprocessing=use_multiprocessing,
-            )
-        elif method in ('dpdp', 'dpbs'):
-            import torch
-            use_cuda = torch.cuda.is_available() and not opts.no_cuda
-            device_count = torch.cuda.device_count() if use_cuda else 0
-            num_cpus = os.cpu_count() if opts.cpus is None else opts.cpus
-            assert device_count == 0 or num_cpus % device_count == 0, "Num cpus must be multiple of CUDA device count"
-
-            def run_func(args):
-                device = torch.device('cuda:0' if use_cuda else 'cpu')
-                if device_count > 1:
-                    from multiprocessing import current_process
-                    # identity is from 1 to num_cpus
-                    p = current_process()
-                    # Define device id from worker id
-                    device_id = (p._identity[0] - 1) % device_count
-                    device = torch.device(f'cuda:{device_id}')
-
-                # device, *args = args
-                directory, name, *args = args
-                args, heatmap = args
-                depot, loc, demand, capacity, *args = args
-                grid_size = 1
-                if len(args) > 0:
-                    depot_types, customer_types, grid_size = args
-                collapse = method == 'dpdp'
-                evaluate_dp(depot, loc, demand, capacity, heatmap, opts.beam_size, collapse, opts.score_function,
-                            opts.heatmap_threshold, opts.knn, opts.verbose, device=device)
-
-            results, parallelism = run_all_in_pool(
-                run_func,
-                target_dir, dataset, opts, use_multiprocessing=num_cpus > 1,
             )
         else:
             assert False, "Unknown method: {}".format(opts.method)

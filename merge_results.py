@@ -25,7 +25,7 @@ if __name__ == "__main__":
     save_opts = None
     merged_dataset = []
     for dataset, ds_opts in sorted(datasets, key=lambda k: k[1].offset):
-        ensure_backwards_compatibility(ds_opts)
+        ensure_backward_compatibility(ds_opts)
 
         if save_opts is None:
             save_opts = ds_opts

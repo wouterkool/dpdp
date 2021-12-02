@@ -1,0 +1,14 @@
+# run: conda env create --file environment.yml
+name: dpdp
+channels:
+- pytorch
+dependencies:
+- python>=3.8
+- anaconda
+- scipy
+- tqdm
+- pytorch
+- torchvision
+- cuda91
+- pip:
+  - tensorboard_logger

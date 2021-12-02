@@ -205,7 +205,7 @@ def unique_inverse(list_of_tensors, return_index=False, return_counts=False, dev
     _, index, *rest = queue.pop(0)
     if return_index:
         inv, *rest = rest
-        return inv, index, *rest
+        return (inv, index, *rest)
     return index if len(rest) == 0 else (index, *rest)
 
 

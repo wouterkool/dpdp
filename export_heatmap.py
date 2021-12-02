@@ -17,6 +17,7 @@ from datetime import timedelta
 from config import get_config
 from problems.vrp.vrp_reader import VRPReader
 from problems.tsp.tsp_reader import TSPReader
+from problems.tsptw.tsptw_reader import TSPTWReader
 
 from models.gcn_model_vrp import ResidualGatedGCNModelVRP
 from models.gcn_model import ResidualGatedGCNModel
@@ -75,7 +76,7 @@ do_prepwrap = not args.no_prepwrap
 # Instantiate the network
 model_class = ResidualGatedGCNModelVRP if args.problem == 'vrp' else ResidualGatedGCNModel
 model = model_class(config, dtypeFloat, dtypeLong)
-if args.problem == 'tsp':
+if args.problem in ('tsp', 'tsptw'):
     if 'sparse' in config and config.sparse is not None:
         model = wrap_sparse(model, config.sparse)
 
@@ -91,7 +92,7 @@ if torch.cuda.is_available():
 else:
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
 # Load network state
-if args.problem == 'tsp':
+if args.problem in ('tsp', 'tsptw'):
     try:
         net.load_state_dict(checkpoint['model_state_dict'])
     except RuntimeError:
@@ -122,7 +123,8 @@ instance_filepath = args.instances
 if args.problem == 'vrp':
     reader = VRPReader(num_nodes, num_neighbors, batch_size, instance_filepath)
 else:
-    reader = TSPReader(num_nodes, num_neighbors, batch_size, instance_filepath, do_prep=not do_prepwrap)
+    DataReader = DataReader = TSPTWReader if args.problem == 'tsptw' else TSPReader
+    reader = DataReader(num_nodes, num_neighbors, batch_size, instance_filepath, do_prep=not do_prepwrap)
 
 assert len(reader.filedata) % batch_size == 0, f"Number of instances {len(reader.filedata)} must be divisible by batch size {batch_size}"
 
@@ -133,12 +135,14 @@ start = time.time()
 for i, batch in enumerate(tqdm(dataset, total=reader.max_iter)):
 
     with torch.no_grad():
-        if args.problem == 'tsp' and do_prepwrap:
+        if args.problem in ('tsp', 'tsptw') and do_prepwrap:
             # Convert batch to torch Variables
             x_nodes_coord = Variable(torch.FloatTensor(batch.nodes_coord).type(dtypeFloat), requires_grad=False)
+            x_nodes_timew = Variable(torch.FloatTensor(batch.nodes_timew).type(dtypeFloat), requires_grad=False) if args.problem == 'tsptw' else None
+
             # Forward pass
             with torch.no_grad():
-                y_preds, loss, _ = net.forward(x_nodes_coord)
+                y_preds, loss, _ = net.forward(x_nodes_coord, x_nodes_timew)
         else:
             # Convert batch to torch Variables
             x_edges = Variable(torch.LongTensor(batch.edges).type(dtypeLong), requires_grad=False)

@@ -8,7 +8,7 @@ from .potentials import get_initial_potential_info
 from .vrp import vrp_solution_to_actions, vrp_actions_to_solutions, get_vrp_cost
 
 
-def run_dp(graph, candidate_queue, return_solution=False, collapse=True,
+def run_dp(graph, candidate_queue, return_solution=False, collapse=True, use_weak_version=False,
            mask_dtype=torch.long, beam_device=None, compute_unique_device=None, bound_first=False,
            sort_beam_by='group_idx', trace_device='cpu', enforce_return_step_feasible='hard',
            verbose=False, profile_every=-1, add_potentials=False, trace_solution=None):
@@ -18,6 +18,7 @@ def run_dp(graph, candidate_queue, return_solution=False, collapse=True,
     :param candidate_queue: The queue which keeps the limited size of the candidates to expand
     :param return_solution: Whether to return the solutions (otherwise, return only final cost)
     :param collapse: Whether to remove dominated solutions. When false, this performs 'plain beam search'.
+    :param use_weak_version: Whether to use 'weak' version. For TSPTW, don't use extended feasibility check.
     :param mask_dtype: Dtype to use for storing the (compressed) mask of visited nodes (default 64bit long)
     :param beam_device: On which device to keep the beam (can be separate device for efficiency for large instances)
     :param compute_unique_device: On which device to perform the costly operation to identify unique masks
@@ -55,7 +56,7 @@ def run_dp(graph, candidate_queue, return_solution=False, collapse=True,
             break
 
         beam = dp_step(
-            step, beam, graph, candidate_queue=candidate_queue, collapse=collapse,
+            step, beam, graph, candidate_queue=candidate_queue, collapse=collapse, use_weak_version=use_weak_version,
             profile=profile_every > 0 and step % profile_every == 0, verbose=verbose,
             compute_unique_device=compute_unique_device, bound_first=bound_first
         )
@@ -148,11 +149,12 @@ def finalize_solutions(beam, graph, return_solution, start_node, trace, trace_de
     return min_final_cost_batch
 
 
-def dp_step(step, beam, graph, candidate_queue, collapse=True, profile=False, verbose=False, compute_unique_device=None, bound_first=False):
+def dp_step(step, beam, graph, candidate_queue, collapse=True, use_weak_version=False,
+            profile=False, verbose=False, compute_unique_device=None, bound_first=False):
     profiler = Profiler(dummy=not profile, device=beam.cost.device)
 
     candidate_queue.reset()
-    actions, parents, scores = get_expansions(beam, bound_first, candidate_queue, collapse, graph, profiler, verbose)
+    actions, parents, scores = get_expansions(beam, bound_first, candidate_queue, collapse, graph, use_weak_version, profiler, verbose)
 
     update_beam(actions, beam, compute_unique_device, graph, parents, profiler, scores)
 

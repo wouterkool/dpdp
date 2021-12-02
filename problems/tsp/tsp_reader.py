@@ -100,11 +100,7 @@ class TSPReader(object):
                 np.fill_diagonal(W, 2)  # Special token for self-connections
 
             if sol is not None:
-                # Convert tour nodes to required format
-                # Don't add final connection for tour/cycle
-                # tour_nodes = [int(node) - 1 for node in line[line.index('output') + 1:-1]][:-1]
-                # dummy for now, no supervision!
-                check_cost, tour_nodes, duration = sol #list(range(len(nodes)))
+                check_cost, tour_nodes, duration = sol
 
                 if self.do_prep:
                     # Compute node and edge representation of tour + tour_len

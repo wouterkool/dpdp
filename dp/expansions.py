@@ -3,11 +3,11 @@ from torch_scatter import segment_min_coo, scatter_min
 
 from dp.potentials import compute_vrp_expansion_solution_potentials, compute_tsp_expansion_solution_potentials
 from utils.mask_utils import view_as_uint8, unpackbits, unpack_mask
-from utils.scatter_utils import segment_sort_coo, segment_cummax_coo
+from utils.scatter_utils import segment_sort_coo, segment_cummax_coo, segment_cummin_coo
 from utils.sorting_utils import unique_consecutive, unique_consecutive_inverse
 
 
-def get_expansions(beam, bound_first, candidate_queue, collapse, graph, profiler, verbose):
+def get_expansions(beam, bound_first, candidate_queue, collapse, graph, use_weak_version, profiler, verbose):
     assert bound_first, "Only supports bound_first"
     assert len(beam.mask) == 1, "Only supports single colgroup for now"
 
@@ -29,7 +29,7 @@ def get_expansions(beam, bound_first, candidate_queue, collapse, graph, profiler
     if beam.current is not None:
         add_expansion_candidates_direct(
             beam, graph, candidate_queue, depot_info, max_num_uint8s, profiler, unvisited_t,
-            bound=candidate_queue.bound, expansion_potentials=expansion_potentials, collapse=collapse)
+            bound=candidate_queue.bound, expansion_potentials=expansion_potentials, collapse=collapse, use_weak_version=use_weak_version)
 
     device = beam.mask[0].device
     all_parent_beamrows, all_actions = candidate_queue.get_payload(device)
@@ -135,7 +135,8 @@ def add_vrp_expansion_candidates_via_depot(beam, graph, candidate_queue, depot_i
 
 
 def add_expansion_candidates_direct(beam, graph, candidate_queue, depot_info, max_num_uint8s, profiler,
-                                        unvisited_t, bound=None, expansion_potentials=None, collapse=True):
+                                    unvisited_t, bound=None, expansion_potentials=None, collapse=True,
+                                    use_weak_version=False):
     current = beam.current.long()
     parent, action = get_unvisited_expansion_candidates(beam, current, graph, max_num_uint8s, unvisited_t)
     profiler.log(f'get {len(parent)} feasible_expansions')
@@ -143,13 +144,14 @@ def add_expansion_candidates_direct(beam, graph, candidate_queue, depot_info, ma
         return
 
     parent, action, cost, batch_id = filter_feasible_expansions(
-        beam, graph, current, parent, action, depot_info, bound, expansion_potentials, collapse)
+        beam, graph, current, parent, action, depot_info, bound,
+        expansion_potentials, unvisited_t, max_num_uint8s, collapse, use_weak_version)
     if len(parent) == 0:
         return None
     profiler.log(f'filter {len(parent)} feasible_expansions with bound {bound if not graph.is_batch else "(batch)"}')
 
     if collapse:
-        collapse_fn = collapse_vrp_expansions if graph.is_vrp else collapse_tsp_expansions
+        collapse_fn = collapse_vrp_expansions if graph.is_vrp else (collapse_tsptw_expansions if graph.has_tw else collapse_tsp_expansions)
         parent, action, cost, batch_id = collapse_fn(batch_id, beam, cost, action, graph, parent)
         profiler.log(f'collapse {len(parent)} feasible_expansions')
 
@@ -189,12 +191,14 @@ def get_unvisited_expansion_candidates(beam, current, graph, max_num_uint8s, unv
     return parent, action
 
 
-def filter_feasible_expansions(beam, graph, current, parent, action, depot_info, bound, expansion_potentials, collapse):
+def filter_feasible_expansions(beam, graph, current, parent, action, depot_info, bound,
+                               expansion_potentials, unvisited_t, max_num_uint8s, collapse, use_weak_version=False):
     """
-    Filters the initial candidates in three ways:
+    Filters the initial candidates in multiple ways:
     * remove expansions that would exceed the vehicle capacity (infeasible)
     * remove expansions with scores above the bound from the candidate queue (cannot be part of topk)
-    * remove expansions dominated by a solution going via the depot to the same node (dominated)
+    * remove expansions dominated by a solution going via the depot to the same node (dominated, only if collapsing)
+    * remove expansions which makes some time windows no longer feasible
     :param beam:
     :param graph:
     :param current:
@@ -224,6 +228,35 @@ def filter_feasible_expansions(beam, graph, current, parent, action, depot_info,
             msk.logical_and_(
                 cost_expansions < beam_min_cost_at_depot.gather(0, parent) + graph.cost_from_depot[
                     batch_id_feasible, action])
+    if graph.has_tw:
+        # Check that this expansion satisfies the timewindow
+        arr = (
+            torch.gather(beam.time, 0, parent) +
+            graph.cost[batch_id_feasible, current_feasible, action]
+        )
+
+        lb, ub = graph.timew[batch_id_feasible, action].unbind(-1)
+        msk_tw = arr <= ub
+
+        # One step lookahead, get for each current entry the earliest ending *unvisited* time window
+        # Check if from each possible extension, we can still make this time window
+        # We also configure a parameter to not use this much stronger extended check
+        if not use_weak_version:
+            unvisited_uint8 = view_as_uint8(unvisited_t.contiguous())[:, :max_num_uint8s]
+            unvisited_unpacked = unpackbits(unvisited_uint8.flatten()).view(*unvisited_uint8.size()[:-1],
+                                    unvisited_uint8.size(-1), 8).flip(-1).flatten(start_dim=-2)[:, :graph.num_nodes]
+            first_due, idx_first_due = torch.where(
+                unvisited_unpacked,
+                graph.timew[beam.batch_ids, :, 1],
+                graph.timew.new_tensor(torch.iinfo(graph.timew.dtype).max)
+            ).min(-1)
+            msk_tw.bitwise_and_(
+                torch.maximum(arr, lb) + graph.cost[batch_id_feasible, action, idx_first_due.gather(0, parent).long()]
+                <= first_due.gather(0, parent)
+            )
+            del unvisited_unpacked, unvisited_uint8
+
+        msk = msk.logical_and_(msk_tw) if msk is not None else msk_tw
     score_expansions = None
     if bound is not None:
         # Since we're going to index anyway we apply the bound also directly
@@ -282,6 +315,46 @@ def collapse_vrp_expansions(batch_id_feasible, beam, cost_expansions, expand_nod
     cummax_remaining_capacity = segment_cummax_coo(remaining_capacity, idx_scatter_expansions)
     msk_feas[1:].logical_and_((idx_scatter_expansions[1:] != idx_scatter_expansions[:-1]).logical_or_(
         remaining_capacity[1:] > cummax_remaining_capacity[:-1]))
+    (idx,) = msk_feas.nonzero(as_tuple=True)
+    parent = torch.gather(idx_feasible_expansion, 0, idx)
+    action = torch.gather(expand_node_idx, 0, idx)
+    cost = torch.gather(sorted_cost_expansions, 0, idx) if beam.score is None else None
+    batch_id = torch.gather(batch_id_feasible, 0, idx) if graph.is_batch else 0
+    return parent, action, cost, batch_id
+
+
+def collapse_tsptw_expansions(batch_id_feasible, beam, cost_expansions, expand_node_idx, graph, idx_feasible_expansion):
+    # Note: here we can use either group_idx or mask_idx but group_idx may be smaller so bit more efficient
+    # TODO this can be optimized, maybe even packed in int if beam size * num_nodes <= 2^31
+    idx_scatter_expansions = torch.gather(beam.group_idx, 0, idx_feasible_expansion)
+    idx_scatter_expansions = (idx_scatter_expansions << 32).bitwise_or_(expand_node_idx)
+    # Note: without sorted by group_idx should also be feasible by using scatter_sort
+    assert beam.sort_by == 'group_idx'
+
+    idx_scatter_expansions, group_sizes = unique_consecutive(idx_scatter_expansions, return_vals=False,
+                                                             return_inverse=True, return_counts=True)
+    # TODO, an optimization may be to filter groups with just 1
+    # TODO max group size 64 would be more efficient but then we need to compute group sizes
+    assert (cost_expansions >= 0).all()
+    sorted_cost_expansions, idx_segment_sort = segment_sort_coo(cost_expansions, idx_scatter_expansions,
+                                                                max_group_size=group_sizes.max())
+    assert (idx_scatter_expansions[idx_segment_sort] == idx_scatter_expansions).all()
+    idx_feasible_expansion = idx_feasible_expansion.gather(0, idx_segment_sort)
+    expand_node_idx = expand_node_idx.gather(0, idx_segment_sort)
+    arr = beam.time.gather(0, idx_feasible_expansion) + graph.cost[
+        batch_id_feasible, beam.current.gather(0, idx_feasible_expansion).long(), expand_node_idx]
+    lb, ub = graph.timew[batch_id_feasible, expand_node_idx, :].unbind(-1)
+    time = torch.maximum(arr, lb)
+    # Now the expansions are sorted by increasing cost, so the next expansion
+    # is worse in terms of cost so is only useful if it is (strictly) better in terms of time windows
+    # i.e. the time should be earlier than the time for all predecessor expansions
+    # so the time should be (strictly) smaller than the minimum time for all predecessor expansions
+    # we can check this using a cummin with
+
+    msk_feas = time <= ub  # Should be all ones if we filtered before
+    cummin_t = segment_cummin_coo(time, idx_scatter_expansions)
+    msk_feas[1:].logical_and_((idx_scatter_expansions[1:] != idx_scatter_expansions[:-1]).logical_or_(
+        time[1:] < cummin_t[:-1]))
     (idx,) = msk_feas.nonzero(as_tuple=True)
     parent = torch.gather(idx_feasible_expansion, 0, idx)
     action = torch.gather(expand_node_idx, 0, idx)

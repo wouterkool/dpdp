@@ -1,0 +1,41 @@
+{
+  "problem": "tsptw",
+  "expt_name": "tsptw100_dir",
+
+  "train_filepath": "data/tsptw/tsptw_cappart100_train_seed42.pkl",
+  "train_filepath_solution": "results/tsptw/tsptw_cappart100_train_seed42/tsptw_cappart100_train_seed42-lkh.pkl",
+
+  "val_filepath": "data/tsptw/tsptw_cappart100_validation_seed4321.pkl",
+  "val_filepath_solution": "results/tsptw/tsptw_cappart100_validation_seed4321/tsptw_cappart100_validation_seed4321-lkh.pkl",
+
+  "test_filepath": "data/tsptw/tsptw_cappart100_test_seed1234.pkl",
+  "test_filepath_solution": "results/tsptw/tsptw_cappart100_test_seed1234/tsptw_cappart100_test_seed1234-lkh.pkl",
+
+  "num_nodes": 100,
+  "num_neighbors": -1,
+    
+  "node_dim": 4,
+  "voc_nodes_in": 2,
+  "voc_nodes_out": 2,
+  "voc_edges_in": 3,
+  "voc_edges_out": 2,
+
+  "beam_size": 1,
+
+  "hidden_dim": 300,
+  "num_layers": 30,
+  "mlp_layers": 3,
+  "aggregation": "mean",
+  "directed": true,
+
+  "max_epochs": 1500,
+  "val_every": 5,
+  "test_every": 100,
+
+  "batch_size": 48,
+  "batches_per_epoch": 500,
+  "accumulation_steps": 1,
+
+  "learning_rate": 0.001,
+  "decay_rate": 1.01
+}
