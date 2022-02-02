@@ -183,7 +183,7 @@ class ResidualGatedGCNLayer(nn.Module):
     """Convnet layer with gating and residual connection.
     """
 
-    def __init__(self, hidden_dim, aggregation="sum", directed=True):
+    def __init__(self, hidden_dim, aggregation="sum", directed=False):
         super(ResidualGatedGCNLayer, self).__init__()
         self.node_feat = NodeFeatures(hidden_dim, aggregation)
         self.edge_feat = EdgeFeatures(hidden_dim, directed)
