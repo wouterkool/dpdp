@@ -38,7 +38,7 @@ pip install tensorboardx==1.5 fastprogress==0.1.18
 # conda install -c conda-forge cupy cudatoolkit=10.2 -y
 pip install cupy-cuda102
 # Also some efficient sparse operations using https://github.com/rusty1s/pytorch_scatter
-pip install torch-scatter -f https://pytorch-geometric.com/whl/torch-1.8.0+cu102.html
+pip install torch-scatter -f https://pytorch-geometric.com/whl/torch-1.10.0+cu102.html
 ```
 
 ## Generate instances (or download)
